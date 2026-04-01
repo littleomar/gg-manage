@@ -1,43 +1,76 @@
-import { SerialPort } from "serialport";
-import { ReadlineParser } from "@serialport/parser-readline";
 import { createLogger } from "../utils/logger.ts";
+import { EventEmitter } from "node:events";
+import * as fs from "node:fs";
 
 const log = createLogger("serial");
 
 export interface SerialConnection {
-  port: SerialPort;
-  parser: ReadlineParser;
+  parser: EventEmitter;
   write: (data: string) => void;
   close: () => Promise<void>;
 }
 
-export function openSerial(path: string, baudRate: number): Promise<SerialConnection> {
-  return new Promise((resolve, reject) => {
-    const port = new SerialPort({ path, baudRate, autoOpen: false });
-    const parser = port.pipe(new ReadlineParser({ delimiter: "\r\n" }));
+export async function openSerial(
+  path: string,
+  baudRate: number,
+): Promise<SerialConnection> {
+  // Configure baud rate via stty
+  const proc = Bun.spawnSync([
+    "stty",
+    "-F",
+    path,
+    baudRate.toString(),
+    "raw",
+    "-echo",
+    "-echoe",
+    "-echok",
+    "-echoctl",
+    "-echoke",
+    "cs8",
+    "-parenb",
+    "-cstopb",
+    "-crtscts",
+  ]);
+  if (proc.exitCode !== 0) {
+    const err = proc.stderr.toString();
+    throw new Error(`Failed to configure ${path}: ${err}`);
+  }
 
-    port.open((err) => {
-      if (err) {
-        log.error(`Failed to open ${path}:`, err.message);
-        reject(err);
-        return;
+  const fd = fs.openSync(path, fs.constants.O_RDWR | fs.constants.O_NOCTTY);
+  const stream = fs.createReadStream("", { fd, autoClose: false });
+
+  const parser = new EventEmitter();
+  let buffer = "";
+
+  stream.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString("utf-8");
+    const lines = buffer.split("\r\n");
+    // Keep the last incomplete segment in buffer
+    buffer = lines.pop()!;
+    for (const line of lines) {
+      if (line.length > 0) {
+        parser.emit("data", line);
       }
-      log.info(`Opened ${path} at ${baudRate} baud`);
-
-      port.on("error", (e) => log.error("Serial error:", e.message));
-      port.on("close", () => log.warn("Serial port closed"));
-
-      resolve({
-        port,
-        parser,
-        write: (data: string) => {
-          port.write(data + "\r\n");
-        },
-        close: () =>
-          new Promise<void>((res, rej) => {
-            port.close((e) => (e ? rej(e) : res()));
-          }),
-      });
-    });
+    }
   });
+
+  stream.on("error", (e) => log.error("Serial read error:", e.message));
+
+  log.info(`Opened ${path} at ${baudRate} baud`);
+
+  return {
+    parser,
+    write: (data: string) => {
+      const buf = Buffer.from(data + "\r\n", "utf-8");
+      fs.writeSync(fd, buf);
+    },
+    close: () => {
+      return new Promise<void>((resolve) => {
+        stream.destroy();
+        fs.closeSync(fd);
+        log.warn("Serial port closed");
+        resolve();
+      });
+    },
+  };
 }
