@@ -2,6 +2,7 @@ import { z } from "zod";
 
 const configSchema = z.object({
   serialPort: z.string().min(1),
+  serialUrcPort: z.string().optional(),
   serialBaud: z.coerce.number().int().positive().default(115200),
 
   telegramBotToken: z.string().min(1),
@@ -18,6 +19,7 @@ export type Config = z.infer<typeof configSchema>;
 export function loadConfig(): Config {
   return configSchema.parse({
     serialPort: process.env.SERIAL_PORT,
+    serialUrcPort: process.env.SERIAL_URC_PORT || undefined,
     serialBaud: process.env.SERIAL_BAUD,
     telegramBotToken: process.env.TELEGRAM_BOT_TOKEN,
     telegramChatId: process.env.TELEGRAM_CHAT_ID,

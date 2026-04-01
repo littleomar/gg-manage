@@ -26,6 +26,14 @@ async function main() {
   const serial = await openSerial(config.serialPort, config.serialBaud);
   const at = new AtParser(serial);
 
+  // Open URC port if configured (Quectel modems deliver URCs on a separate port)
+  let urcSerial: Awaited<ReturnType<typeof openSerial>> | null = null;
+  if (config.serialUrcPort) {
+    log.info(`URC port: ${config.serialUrcPort}`);
+    urcSerial = await openSerial(config.serialUrcPort, config.serialBaud);
+    urcSerial.parser.on("data", (line: string) => at.feedUrc(line));
+  }
+
   // Modem init sequence
   log.info("Initializing modem...");
   await at.execute("ATE0"); // Disable echo
@@ -81,6 +89,7 @@ async function main() {
     log.info("Shutting down...");
     forwarder.stop();
     bot.stop();
+    if (urcSerial) await urcSerial.close();
     await serial.close();
     process.exit(0);
   };

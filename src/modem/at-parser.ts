@@ -49,6 +49,14 @@ export class AtParser {
     this.urcHandlers.push(handler);
   }
 
+  /** Feed a URC line from an external source (e.g. a separate URC port) */
+  feedUrc(line: string): void {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    log.debug(`<< [urc-port] ${trimmed}`);
+    this.dispatchUrc(trimmed);
+  }
+
   private processNext(): void {
     if (this.current || this.queue.length === 0) return;
 

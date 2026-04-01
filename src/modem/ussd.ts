@@ -37,8 +37,9 @@ export async function sendUssd(at: AtParser, code: string, timeoutMs = 60000): P
 
     at.onUnsolicited(handler);
 
-    // Send without DCS parameter — let the modem use its default encoding
-    at.execute(`AT+CUSD=1,"${code}"`).catch((e) => {
+    // Encode USSD code as UCS2 hex (required when modem is in UCS2 mode)
+    const ucs2Code = encodeUcs2Hex(code);
+    at.execute(`AT+CUSD=1,"${ucs2Code}",15`).catch((e) => {
       clearTimeout(timer);
       cleanup();
       reject(e);
@@ -75,6 +76,14 @@ function decodeUssdResponse(text: string, dcs: number): string {
   }
 
   return text;
+}
+
+function encodeUcs2Hex(text: string): string {
+  let hex = "";
+  for (let i = 0; i < text.length; i++) {
+    hex += text.charCodeAt(i).toString(16).padStart(4, "0").toUpperCase();
+  }
+  return hex;
 }
 
 function decodeUcs2Hex(hex: string): string {
