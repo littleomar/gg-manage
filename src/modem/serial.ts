@@ -35,62 +35,49 @@ export async function openSerial(
     }
   }
 
-  const fd = fs.openSync(path, fs.constants.O_RDWR | fs.constants.O_NOCTTY | fs.constants.O_NONBLOCK);
+  // Open fd for writing
+  const writeFd = fs.openSync(path, fs.constants.O_WRONLY | fs.constants.O_NOCTTY);
+
+  // Use cat subprocess for reliable continuous reading
+  const reader = Bun.spawn(["cat", path], {
+    stdout: "pipe",
+    stderr: "ignore",
+  });
 
   const parser = new EventEmitter();
   let lineBuffer = "";
-  let closed = false;
 
-  // Continuous read loop using non-blocking fd + polling
-  const readBuf = Buffer.alloc(1024);
-  const poll = () => {
-    if (closed) return;
-    fs.read(fd, readBuf, 0, readBuf.length, null, (err, bytesRead) => {
-      if (closed) return;
-      if (err) {
-        // EAGAIN means no data available on non-blocking fd
-        if ((err as NodeJS.ErrnoException).code === "EAGAIN") {
-          setTimeout(poll, 50);
-          return;
-        }
-        log.error("Serial read error:", err.message);
-        setTimeout(poll, 100);
-        return;
-      }
-
-      if (bytesRead > 0) {
-        lineBuffer += readBuf.subarray(0, bytesRead).toString("utf-8");
-        const lines = lineBuffer.split("\r\n");
-        lineBuffer = lines.pop()!;
-        for (const line of lines) {
-          if (line.length > 0) {
-            parser.emit("data", line);
-          }
+  // Read from cat's stdout stream
+  (async () => {
+    const stream = reader.stdout;
+    const textDecoder = new TextDecoder();
+    for await (const chunk of stream) {
+      const text = textDecoder.decode(chunk, { stream: true });
+      lineBuffer += text;
+      const lines = lineBuffer.split("\r\n");
+      lineBuffer = lines.pop()!;
+      for (const line of lines) {
+        if (line.length > 0) {
+          parser.emit("data", line);
         }
       }
+    }
+  })().catch((e) => {
+    log.error("Serial reader error:", e);
+  });
 
-      // Continue reading immediately if we got data, otherwise short delay
-      if (bytesRead > 0) {
-        poll();
-      } else {
-        setTimeout(poll, 50);
-      }
-    });
-  };
-
-  poll();
   log.info(`Opened ${path} at ${baudRate} baud`);
 
   return {
     parser,
     write: (data: string) => {
       const buf = Buffer.from(data + "\r\n", "utf-8");
-      fs.writeSync(fd, buf);
+      fs.writeSync(writeFd, buf);
     },
     close: () => {
       return new Promise<void>((resolve) => {
-        closed = true;
-        fs.closeSync(fd);
+        reader.kill();
+        fs.closeSync(writeFd);
         log.warn("Serial port closed");
         resolve();
       });
