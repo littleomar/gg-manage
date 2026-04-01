@@ -37,9 +37,7 @@ export async function sendUssd(at: AtParser, code: string, timeoutMs = 60000): P
 
     at.onUnsolicited(handler);
 
-    // Encode USSD code as UCS2 hex (required when modem is in UCS2 mode)
-    const ucs2Code = encodeUcs2Hex(code);
-    at.execute(`AT+CUSD=1,"${ucs2Code}",72`).catch((e) => {
+    at.execute(`AT+CUSD=1,"${code}",15`).catch((e) => {
       clearTimeout(timer);
       cleanup();
       reject(e);
