@@ -1,69 +1,157 @@
 import { Bot } from "grammy";
-import { SocksProxyAgent } from "socks-proxy-agent";
-import * as https from "node:https";
+import { SocksClient } from "socks";
+import * as tls from "node:tls";
 import type { Config } from "../config.ts";
 import { createLogger } from "../utils/logger.ts";
 
 const log = createLogger("bot");
 
+function parseSocksUrl(proxyUrl: string) {
+  const url = new URL(proxyUrl);
+  const type = url.protocol.startsWith("socks4") ? 4 : 5;
+  return {
+    host: url.hostname,
+    port: parseInt(url.port) || 1080,
+    type: type as 4 | 5,
+    ...(url.username ? { userId: url.username } : {}),
+    ...(url.password ? { password: url.password } : {}),
+  };
+}
+
 function createSocksFetch(proxyUrl: string): typeof fetch {
-  const agent = new SocksProxyAgent(proxyUrl);
+  const proxy = parseSocksUrl(proxyUrl);
 
-  return (input, init?) => {
-    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+  return async (input, init?) => {
+    const url = new URL(
+      typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url,
+    );
     const method = init?.method ?? "GET";
-    const headers = init?.headers instanceof Headers
-      ? Object.fromEntries(init.headers.entries())
-      : (init?.headers as Record<string, string>) ?? {};
+    const headers: Record<string, string> = {};
 
-    return new Promise<Response>((resolve, reject) => {
-      const req = https.request(url, { method, headers, agent }, (res) => {
-        const chunks: Buffer[] = [];
-        res.on("data", (chunk) => chunks.push(chunk));
-        res.on("end", () => {
-          const body = Buffer.concat(chunks);
-          resolve(
-            new Response(body, {
-              status: res.statusCode ?? 200,
-              statusText: res.statusMessage ?? "",
-              headers: res.headers as Record<string, string>,
-            }),
-          );
-        });
-        res.on("error", reject);
+    if (init?.headers instanceof Headers) {
+      init.headers.forEach((v, k) => (headers[k] = v));
+    } else if (init?.headers) {
+      Object.assign(headers, init.headers);
+    }
+
+    if (!headers["host"]) headers["host"] = url.host;
+
+    // Establish SOCKS connection to target
+    const { socket } = await SocksClient.createConnection({
+      proxy,
+      command: "connect",
+      destination: {
+        host: url.hostname,
+        port: parseInt(url.port) || (url.protocol === "https:" ? 443 : 80),
+      },
+    });
+
+    // Upgrade to TLS for HTTPS
+    const tlsSocket = url.protocol === "https:"
+      ? tls.connect({ socket, servername: url.hostname })
+      : socket;
+
+    if (tlsSocket !== socket) {
+      await new Promise<void>((resolve, reject) => {
+        (tlsSocket as tls.TLSSocket).once("secureConnect", resolve);
+        (tlsSocket as tls.TLSSocket).once("error", reject);
       });
+    }
 
-      req.on("error", reject);
-
-      if (init?.body) {
-        if (init.body instanceof ReadableStream) {
-          const reader = init.body.getReader();
-          const pump = (): Promise<void> =>
-            reader.read().then(({ done, value }) => {
-              if (done) {
-                req.end();
-                return;
-              }
-              req.write(value);
-              return pump();
-            });
-          pump().catch(reject);
-        } else {
-          req.write(init.body);
-          req.end();
+    // Build raw HTTP request
+    const path = url.pathname + url.search;
+    let body: Buffer | null = null;
+    if (init?.body) {
+      if (typeof init.body === "string") {
+        body = Buffer.from(init.body);
+      } else if (init.body instanceof ArrayBuffer || init.body instanceof Uint8Array) {
+        body = Buffer.from(init.body);
+      } else if (init.body instanceof ReadableStream) {
+        const reader = init.body.getReader();
+        const chunks: Uint8Array[] = [];
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
         }
+        body = Buffer.concat(chunks);
       } else {
-        req.end();
+        body = Buffer.from(String(init.body));
       }
+    }
+
+    if (body) headers["content-length"] = body.byteLength.toString();
+
+    const headerLines = Object.entries(headers)
+      .map(([k, v]) => `${k}: ${v}`)
+      .join("\r\n");
+
+    const requestHead = `${method} ${path} HTTP/1.1\r\n${headerLines}\r\n\r\n`;
+    tlsSocket.write(requestHead);
+    if (body) tlsSocket.write(body);
+
+    // Read response
+    return new Promise<Response>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      tlsSocket.on("data", (chunk: Buffer) => chunks.push(chunk));
+      tlsSocket.on("error", reject);
+      tlsSocket.on("end", () => {
+        const raw = Buffer.concat(chunks).toString();
+        const headerEnd = raw.indexOf("\r\n\r\n");
+        if (headerEnd === -1) {
+          reject(new Error("Invalid HTTP response"));
+          return;
+        }
+
+        const headerSection = raw.slice(0, headerEnd);
+        const bodySection = raw.slice(headerEnd + 4);
+        const [statusLine, ...headerParts] = headerSection.split("\r\n");
+        const statusMatch = statusLine.match(/HTTP\/[\d.]+ (\d+)\s*(.*)/);
+        const status = statusMatch ? parseInt(statusMatch[1]) : 200;
+        const statusText = statusMatch?.[2] ?? "";
+
+        const respHeaders: Record<string, string> = {};
+        for (const h of headerParts) {
+          const idx = h.indexOf(":");
+          if (idx > 0) {
+            respHeaders[h.slice(0, idx).trim().toLowerCase()] = h.slice(idx + 1).trim();
+          }
+        }
+
+        // Handle chunked transfer encoding
+        let responseBody: string;
+        if (respHeaders["transfer-encoding"]?.includes("chunked")) {
+          responseBody = decodeChunked(bodySection);
+        } else {
+          responseBody = bodySection;
+        }
+
+        resolve(
+          new Response(responseBody, { status, statusText, headers: respHeaders }),
+        );
+      });
     });
   };
+}
+
+function decodeChunked(data: string): string {
+  const parts: string[] = [];
+  let remaining = data;
+  while (remaining.length > 0) {
+    const lineEnd = remaining.indexOf("\r\n");
+    if (lineEnd === -1) break;
+    const size = parseInt(remaining.slice(0, lineEnd), 16);
+    if (size === 0) break;
+    parts.push(remaining.slice(lineEnd + 2, lineEnd + 2 + size));
+    remaining = remaining.slice(lineEnd + 2 + size + 2);
+  }
+  return parts.join("");
 }
 
 export function createBot(config: Config): Bot {
   const isSocks = config.telegramProxyUrl?.startsWith("socks");
 
   if (config.telegramProxyUrl && !isSocks) {
-    // HTTP proxy — Bun's fetch respects these env vars
     log.info(`Using HTTP proxy: ${config.telegramProxyUrl}`);
     process.env.HTTPS_PROXY = config.telegramProxyUrl;
     process.env.HTTP_PROXY = config.telegramProxyUrl;
