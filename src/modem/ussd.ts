@@ -37,11 +37,20 @@ export async function sendUssd(at: AtParser, code: string, timeoutMs = 60000): P
 
     at.onUnsolicited(handler);
 
-    at.execute(`AT+CUSD=1,"${code}",15`).catch((e) => {
-      clearTimeout(timer);
-      cleanup();
-      reject(e);
-    });
+    // Switch to GSM charset for USSD, then restore UCS2 after sending
+    (async () => {
+      try {
+        await at.execute('AT+CSCS="GSM"');
+        await at.execute(`AT+CUSD=1,"${code}",15`);
+        await at.execute('AT+CSCS="UCS2"');
+      } catch (e) {
+        clearTimeout(timer);
+        cleanup();
+        // Restore charset on error
+        at.execute('AT+CSCS="UCS2"').catch(() => {});
+        reject(e instanceof Error ? e : new Error(String(e)));
+      }
+    })();
   });
 }
 
