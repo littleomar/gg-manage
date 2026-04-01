@@ -55,24 +55,45 @@ export async function deleteAllSms(at: AtParser): Promise<void> {
   }
 }
 
+/** Decode UCS2 hex string (e.g. "00480065006C006C006F") to text */
+function decodeUcs2Hex(hex: string): string {
+  // Check if it looks like UCS2 hex (even length, all hex chars)
+  if (!/^[0-9A-Fa-f]+$/.test(hex) || hex.length % 4 !== 0) {
+    return hex; // Return as-is if not UCS2 hex
+  }
+  let result = "";
+  for (let i = 0; i < hex.length; i += 4) {
+    result += String.fromCharCode(parseInt(hex.slice(i, i + 4), 16));
+  }
+  return result;
+}
+
+/** Try to decode a field that might be UCS2 hex or plain text */
+function decodeField(value: string): string {
+  if (!value) return value;
+  const decoded = decodeUcs2Hex(value);
+  // If decoding produced readable text, use it
+  return decoded;
+}
+
 function parseSmsResponse(resp: string, index: number): SmsMessage | null {
   // +CMGR: "REC UNREAD","+447xxx","","26/03/31,14:00:00+32"
-  // Message body on next line(s)
+  // +CMGR: "REC UNREAD","00670069006600660067006100660066",,"26/04/01,02:48:18+4"
   const lines = resp.split("\n");
   const headerLine = lines.find((l) => l.startsWith("+CMGR:"));
   if (!headerLine) return null;
 
-  const match = headerLine.match(/\+CMGR:\s*"[^"]*","([^"]*)","[^"]*","([^"]*)"/);
-  const sender = match?.[1] ?? "Unknown";
+  const match = headerLine.match(/\+CMGR:\s*"[^"]*",\s*"([^"]*)"(?:,\s*"[^"]*")?,\s*"?([^"]*)"?/);
+  const sender = decodeField(match?.[1] ?? "Unknown");
   const timestamp = match?.[2] ?? "";
 
   const headerIdx = lines.indexOf(headerLine);
-  const body = lines
+  const rawBody = lines
     .slice(headerIdx + 1)
     .join("\n")
     .trim();
 
-  return { index, sender, timestamp, body };
+  return { index, sender, timestamp, body: decodeField(rawBody) };
 }
 
 function parseSmsList(resp: string): SmsMessage[] {
@@ -83,11 +104,17 @@ function parseSmsList(resp: string): SmsMessage[] {
     const line = lines[i]!;
     if (!line.startsWith("+CMGL:")) continue;
 
-    const match = line.match(/\+CMGL:\s*(\d+),"[^"]*","([^"]*)","[^"]*","([^"]*)"/);
-    if (!match) continue;
+    // Handle various formats:
+    // +CMGL: 1,"REC UNREAD","+447xxx","","26/03/31,14:00:00+32"
+    // +CMGL: 1,"REC UNREAD","00670069006600660067006100660066",,"26/04/01,02:48:18+4"
+    const match = line.match(/\+CMGL:\s*(\d+),\s*"[^"]*",\s*"([^"]*)"(?:,\s*"[^"]*")?,\s*"?([^"]*)"?/);
+    if (!match) {
+      log.warn(`Failed to parse CMGL line: ${line}`);
+      continue;
+    }
 
     const index = parseInt(match[1]!);
-    const sender = match[2] ?? "Unknown";
+    const sender = decodeField(match[2] ?? "Unknown");
     const timestamp = match[3] ?? "";
 
     const bodyLines: string[] = [];
@@ -96,7 +123,8 @@ function parseSmsList(resp: string): SmsMessage[] {
       bodyLines.push(lines[j]!);
     }
 
-    messages.push({ index, sender, timestamp, body: bodyLines.join("\n").trim() });
+    const rawBody = bodyLines.join("\n").trim();
+    messages.push({ index, sender, timestamp, body: decodeField(rawBody) });
   }
 
   return messages;
