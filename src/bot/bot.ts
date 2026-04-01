@@ -2,116 +2,96 @@ import { Bot } from "grammy";
 import { SocksClient } from "socks";
 import * as tls from "node:tls";
 import * as net from "node:net";
+import type { Duplex } from "node:stream";
 import type { Config } from "../config.ts";
 import { createLogger } from "../utils/logger.ts";
 
 const log = createLogger("bot");
 
-function parseSocksUrl(proxyUrl: string) {
-  const url = new URL(proxyUrl);
-  const type = url.protocol.startsWith("socks4") ? 4 : 5;
-  return {
-    host: url.hostname,
-    port: parseInt(url.port) || 1080,
-    type: type as 4 | 5,
-    ...(url.username ? { userId: url.username } : {}),
-    ...(url.password ? { password: url.password } : {}),
-  };
+/** Collect headers from init, inject host and connection: close */
+function buildHeaders(init: RequestInit | undefined, host: string): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (init?.headers instanceof Headers) {
+    init.headers.forEach((v, k) => (headers[k] = v));
+  } else if (init?.headers) {
+    Object.assign(headers, init.headers);
+  }
+  if (!headers["host"]) headers["host"] = host;
+  headers["connection"] = "close";
+  return headers;
 }
 
-function createSocksFetch(proxyUrl: string): typeof fetch {
-  const proxy = parseSocksUrl(proxyUrl);
-
-  return async (input, init?) => {
-    const url = new URL(
-      typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url,
-    );
-    const method = init?.method ?? "GET";
-    const headers: Record<string, string> = {};
-
-    if (init?.headers instanceof Headers) {
-      init.headers.forEach((v, k) => (headers[k] = v));
-    } else if (init?.headers) {
-      Object.assign(headers, init.headers);
+/** Read request body into a Buffer */
+async function readBody(init: RequestInit | undefined): Promise<Buffer | null> {
+  if (!init?.body) return null;
+  if (typeof init.body === "string") return Buffer.from(init.body);
+  if (init.body instanceof ArrayBuffer || init.body instanceof Uint8Array) return Buffer.from(init.body);
+  if (init.body instanceof ReadableStream) {
+    const reader = init.body.getReader();
+    const chunks: Uint8Array[] = [];
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
     }
+    return Buffer.concat(chunks);
+  }
+  return Buffer.from(String(init.body));
+}
 
-    if (!headers["host"]) headers["host"] = url.host;
+/** Send an HTTP request over a connected socket and return a Response */
+function httpOverSocket(socket: Duplex, method: string, path: string, headers: Record<string, string>, body: Buffer | null): Promise<Response> {
+  if (body) headers["content-length"] = body.byteLength.toString();
 
-    // Establish SOCKS connection to target
-    const { socket } = await SocksClient.createConnection({
-      proxy,
-      command: "connect",
-      destination: {
-        host: url.hostname,
-        port: parseInt(url.port) || (url.protocol === "https:" ? 443 : 80),
-      },
-    });
+  const headerLines = Object.entries(headers).map(([k, v]) => `${k}: ${v}`).join("\r\n");
+  socket.write(`${method} ${path} HTTP/1.1\r\n${headerLines}\r\n\r\n`);
+  if (body) socket.write(body);
 
-    // Upgrade to TLS for HTTPS
-    const tlsSocket = url.protocol === "https:"
-      ? tls.connect({ socket, servername: url.hostname })
-      : socket;
+  return new Promise<Response>((resolve, reject) => {
+    let buf = Buffer.alloc(0);
+    let headersParsed = false;
+    let contentLength = -1;
+    let isChunked = false;
+    let headerEnd = -1;
+    let respStatus = 200;
+    let respStatusText = "";
+    let respHeaders: Record<string, string> = {};
 
-    if (tlsSocket !== socket) {
-      await new Promise<void>((resolve, reject) => {
-        (tlsSocket as tls.TLSSocket).once("secureConnect", resolve);
-        (tlsSocket as tls.TLSSocket).once("error", reject);
-      });
-    }
+    const tryResolve = () => {
+      const bodyBuf = buf.subarray(headerEnd + 4);
 
-    // Build raw HTTP request
-    const path = url.pathname + url.search;
-    let body: Buffer | null = null;
-    if (init?.body) {
-      if (typeof init.body === "string") {
-        body = Buffer.from(init.body);
-      } else if (init.body instanceof ArrayBuffer || init.body instanceof Uint8Array) {
-        body = Buffer.from(init.body);
-      } else if (init.body instanceof ReadableStream) {
-        const reader = init.body.getReader();
-        const chunks: Uint8Array[] = [];
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          chunks.push(value);
+      if (isChunked) {
+        const bodyStr = bodyBuf.toString();
+        // Chunked body ends with "0\r\n\r\n"
+        if (bodyStr.includes("\r\n0\r\n")) {
+          socket.destroy();
+          resolve(new Response(decodeChunked(bodyStr), { status: respStatus, statusText: respStatusText, headers: respHeaders }));
+          return true;
         }
-        body = Buffer.concat(chunks);
-      } else {
-        body = Buffer.from(String(init.body));
+      } else if (contentLength >= 0) {
+        if (bodyBuf.length >= contentLength) {
+          socket.destroy();
+          resolve(new Response(bodyBuf.subarray(0, contentLength).toString(), { status: respStatus, statusText: respStatusText, headers: respHeaders }));
+          return true;
+        }
       }
-    }
+      return false;
+    };
 
-    if (body) headers["content-length"] = body.byteLength.toString();
+    socket.on("data", (chunk: Buffer) => {
+      buf = Buffer.concat([buf, chunk]);
 
-    const headerLines = Object.entries(headers)
-      .map(([k, v]) => `${k}: ${v}`)
-      .join("\r\n");
+      if (!headersParsed) {
+        headerEnd = buf.indexOf("\r\n\r\n");
+        if (headerEnd === -1) return;
+        headersParsed = true;
 
-    const requestHead = `${method} ${path} HTTP/1.1\r\n${headerLines}\r\n\r\n`;
-    tlsSocket.write(requestHead);
-    if (body) tlsSocket.write(body);
-
-    // Read response
-    return new Promise<Response>((resolve, reject) => {
-      const chunks: Buffer[] = [];
-      tlsSocket.on("data", (chunk: Buffer) => chunks.push(chunk));
-      tlsSocket.on("error", reject);
-      tlsSocket.on("end", () => {
-        const raw = Buffer.concat(chunks).toString();
-        const headerEnd = raw.indexOf("\r\n\r\n");
-        if (headerEnd === -1) {
-          reject(new Error("Invalid HTTP response"));
-          return;
-        }
-
-        const headerSection = raw.slice(0, headerEnd);
-        const bodySection = raw.slice(headerEnd + 4);
+        const headerSection = buf.subarray(0, headerEnd).toString();
         const [statusLine, ...headerParts] = headerSection.split("\r\n");
         const statusMatch = statusLine.match(/HTTP\/[\d.]+ (\d+)\s*(.*)/);
-        const status = statusMatch ? parseInt(statusMatch[1]) : 200;
-        const statusText = statusMatch?.[2] ?? "";
+        respStatus = statusMatch ? parseInt(statusMatch[1]) : 200;
+        respStatusText = statusMatch?.[2] ?? "";
 
-        const respHeaders: Record<string, string> = {};
         for (const h of headerParts) {
           const idx = h.indexOf(":");
           if (idx > 0) {
@@ -119,20 +99,27 @@ function createSocksFetch(proxyUrl: string): typeof fetch {
           }
         }
 
-        // Handle chunked transfer encoding
-        let responseBody: string;
-        if (respHeaders["transfer-encoding"]?.includes("chunked")) {
-          responseBody = decodeChunked(bodySection);
-        } else {
-          responseBody = bodySection;
-        }
+        contentLength = respHeaders["content-length"] ? parseInt(respHeaders["content-length"]) : -1;
+        isChunked = respHeaders["transfer-encoding"]?.includes("chunked") ?? false;
+      }
 
-        resolve(
-          new Response(responseBody, { status, statusText, headers: respHeaders }),
-        );
-      });
+      if (headersParsed) tryResolve();
     });
-  };
+
+    // Fallback: resolve on connection close
+    socket.on("end", () => {
+      if (headersParsed) {
+        const bodyBuf = buf.subarray(headerEnd + 4);
+        let responseBody = bodyBuf.toString();
+        if (isChunked) responseBody = decodeChunked(responseBody);
+        resolve(new Response(responseBody, { status: respStatus, statusText: respStatusText, headers: respHeaders }));
+      } else {
+        reject(new Error("Connection closed before headers received"));
+      }
+    });
+
+    socket.on("error", reject);
+  });
 }
 
 function decodeChunked(data: string): string {
@@ -149,30 +136,58 @@ function decodeChunked(data: string): string {
   return parts.join("");
 }
 
+/** Connect to target via TLS, optionally through an existing socket */
+async function connectTls(base: net.Socket, hostname: string): Promise<tls.TLSSocket> {
+  const tlsSocket = tls.connect({ socket: base, servername: hostname });
+  await new Promise<void>((resolve, reject) => {
+    tlsSocket.once("secureConnect", resolve);
+    tlsSocket.once("error", reject);
+  });
+  return tlsSocket;
+}
+
+function createSocksFetch(proxyUrl: string): typeof fetch {
+  const parsed = new URL(proxyUrl);
+  const proxy = {
+    host: parsed.hostname,
+    port: parseInt(parsed.port) || 1080,
+    type: (parsed.protocol.startsWith("socks4") ? 4 : 5) as 4 | 5,
+    ...(parsed.username ? { userId: parsed.username } : {}),
+    ...(parsed.password ? { password: parsed.password } : {}),
+  };
+
+  return async (input, init?) => {
+    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+    const headers = buildHeaders(init, url.host);
+    const body = await readBody(init);
+
+    const { socket } = await SocksClient.createConnection({
+      proxy,
+      command: "connect",
+      destination: {
+        host: url.hostname,
+        port: parseInt(url.port) || (url.protocol === "https:" ? 443 : 80),
+      },
+    });
+
+    const conn = url.protocol === "https:" ? await connectTls(socket, url.hostname) : socket;
+    return httpOverSocket(conn, init?.method ?? "GET", url.pathname + url.search, headers, body);
+  };
+}
+
 function createHttpProxyFetch(proxyUrl: string): typeof fetch {
   const proxy = new URL(proxyUrl);
   const proxyHost = proxy.hostname;
   const proxyPort = parseInt(proxy.port) || 8080;
 
   return async (input, init?) => {
-    const url = new URL(
-      typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url,
-    );
-    const method = init?.method ?? "GET";
-    const headers: Record<string, string> = {};
-
-    if (init?.headers instanceof Headers) {
-      init.headers.forEach((v, k) => (headers[k] = v));
-    } else if (init?.headers) {
-      Object.assign(headers, init.headers);
-    }
-
-    if (!headers["host"]) headers["host"] = url.host;
+    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+    const headers = buildHeaders(init, url.host);
+    const body = await readBody(init);
 
     const targetHost = url.hostname;
     const targetPort = parseInt(url.port) || (url.protocol === "https:" ? 443 : 80);
 
-    // HTTP CONNECT tunnel for HTTPS
     const proxySocket = net.connect(proxyPort, proxyHost);
     await new Promise<void>((resolve, reject) => {
       proxySocket.once("connect", resolve);
@@ -180,10 +195,8 @@ function createHttpProxyFetch(proxyUrl: string): typeof fetch {
     });
 
     if (url.protocol === "https:") {
-      // Send CONNECT request
+      // HTTP CONNECT tunnel
       proxySocket.write(`CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n\r\n`);
-
-      // Wait for 200 response
       await new Promise<void>((resolve, reject) => {
         let buf = "";
         const onData = (chunk: Buffer) => {
@@ -202,89 +215,8 @@ function createHttpProxyFetch(proxyUrl: string): typeof fetch {
       });
     }
 
-    // Upgrade to TLS for HTTPS
-    const socket = url.protocol === "https:"
-      ? tls.connect({ socket: proxySocket, servername: targetHost })
-      : proxySocket;
-
-    if (socket !== proxySocket) {
-      await new Promise<void>((resolve, reject) => {
-        (socket as tls.TLSSocket).once("secureConnect", resolve);
-        (socket as tls.TLSSocket).once("error", reject);
-      });
-    }
-
-    // Build and send HTTP request
-    let body: Buffer | null = null;
-    if (init?.body) {
-      if (typeof init.body === "string") {
-        body = Buffer.from(init.body);
-      } else if (init.body instanceof ArrayBuffer || init.body instanceof Uint8Array) {
-        body = Buffer.from(init.body);
-      } else if (init.body instanceof ReadableStream) {
-        const reader = init.body.getReader();
-        const chunks: Uint8Array[] = [];
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          chunks.push(value);
-        }
-        body = Buffer.concat(chunks);
-      } else {
-        body = Buffer.from(String(init.body));
-      }
-    }
-
-    if (body) headers["content-length"] = body.byteLength.toString();
-
-    const path = url.pathname + url.search;
-    const headerLines = Object.entries(headers)
-      .map(([k, v]) => `${k}: ${v}`)
-      .join("\r\n");
-
-    socket.write(`${method} ${path} HTTP/1.1\r\n${headerLines}\r\n\r\n`);
-    if (body) socket.write(body);
-
-    // Read response
-    return new Promise<Response>((resolve, reject) => {
-      const chunks: Buffer[] = [];
-      socket.on("data", (chunk: Buffer) => chunks.push(chunk));
-      socket.on("error", reject);
-      socket.on("end", () => {
-        const raw = Buffer.concat(chunks).toString();
-        const headerEnd = raw.indexOf("\r\n\r\n");
-        if (headerEnd === -1) {
-          reject(new Error("Invalid HTTP response"));
-          return;
-        }
-
-        const headerSection = raw.slice(0, headerEnd);
-        const bodySection = raw.slice(headerEnd + 4);
-        const [statusLine, ...headerParts] = headerSection.split("\r\n");
-        const statusMatch = statusLine.match(/HTTP\/[\d.]+ (\d+)\s*(.*)/);
-        const status = statusMatch ? parseInt(statusMatch[1]) : 200;
-        const statusText = statusMatch?.[2] ?? "";
-
-        const respHeaders: Record<string, string> = {};
-        for (const h of headerParts) {
-          const idx = h.indexOf(":");
-          if (idx > 0) {
-            respHeaders[h.slice(0, idx).trim().toLowerCase()] = h.slice(idx + 1).trim();
-          }
-        }
-
-        let responseBody: string;
-        if (respHeaders["transfer-encoding"]?.includes("chunked")) {
-          responseBody = decodeChunked(bodySection);
-        } else {
-          responseBody = bodySection;
-        }
-
-        resolve(
-          new Response(responseBody, { status, statusText, headers: respHeaders }),
-        );
-      });
-    });
+    const conn = url.protocol === "https:" ? await connectTls(proxySocket, targetHost) : proxySocket;
+    return httpOverSocket(conn, init?.method ?? "GET", url.pathname + url.search, headers, body);
   };
 }
 
