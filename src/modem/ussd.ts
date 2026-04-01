@@ -7,6 +7,7 @@ export async function sendUssd(at: AtParser, code: string, timeoutMs = 60000): P
   return new Promise<string>((resolve, reject) => {
     const timer = setTimeout(() => {
       cleanup();
+      at.execute('AT+CSCS="UCS2"').catch(() => {});
       reject(new Error(`USSD timed out for code: ${code}`));
     }, timeoutMs);
 
@@ -16,6 +17,9 @@ export async function sendUssd(at: AtParser, code: string, timeoutMs = 60000): P
       log.debug(`USSD URC received: ${line}`);
       clearTimeout(timer);
       cleanup();
+
+      // Restore UCS2 charset after receiving response
+      at.execute('AT+CSCS="UCS2"').catch(() => {});
 
       // +CUSD: 0,"Your balance is £5.00",15
       // +CUSD: 0,"UCS2 hex encoded response",72
@@ -37,16 +41,14 @@ export async function sendUssd(at: AtParser, code: string, timeoutMs = 60000): P
 
     at.onUnsolicited(handler);
 
-    // Switch to GSM charset for USSD, then restore UCS2 after sending
+    // Switch to GSM charset for USSD — restore UCS2 after response arrives
     (async () => {
       try {
         await at.execute('AT+CSCS="GSM"');
-        await at.execute(`AT+CUSD=1,"${code}"`);
-        await at.execute('AT+CSCS="UCS2"');
+        await at.execute(`AT+CUSD=1,"${code}",15`);
       } catch (e) {
         clearTimeout(timer);
         cleanup();
-        // Restore charset on error
         at.execute('AT+CSCS="UCS2"').catch(() => {});
         reject(e instanceof Error ? e : new Error(String(e)));
       }
