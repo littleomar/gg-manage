@@ -41,7 +41,7 @@ export async function sendUssd(at: AtParser, code: string, timeoutMs = 60000): P
     (async () => {
       try {
         await at.execute('AT+CSCS="GSM"');
-        await at.execute(`AT+CUSD=1,"${code}",15`);
+        await at.execute(`AT+CUSD=1,"${code}"`);
         await at.execute('AT+CSCS="UCS2"');
       } catch (e) {
         clearTimeout(timer);
