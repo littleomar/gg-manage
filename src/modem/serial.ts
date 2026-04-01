@@ -14,27 +14,25 @@ export async function openSerial(
   path: string,
   baudRate: number,
 ): Promise<SerialConnection> {
-  // Configure baud rate via stty
-  const proc = Bun.spawnSync([
+  // Configure baud rate and raw mode via stty
+  const base = Bun.spawnSync([
     "stty",
     "-F",
     path,
     baudRate.toString(),
     "raw",
     "-echo",
-    "-echoe",
-    "-echok",
-    "-echoctl",
-    "-echoke",
     "cs8",
     "-parenb",
     "-cstopb",
-    "-crtscts",
   ]);
-  if (proc.exitCode !== 0) {
-    const err = proc.stderr.toString();
+  if (base.exitCode !== 0) {
+    const err = base.stderr.toString();
     throw new Error(`Failed to configure ${path}: ${err}`);
   }
+
+  // Disable hardware flow control if supported (not all devices support it)
+  Bun.spawnSync(["stty", "-F", path, "-crtscts"]);
 
   const fd = fs.openSync(path, fs.constants.O_RDWR | fs.constants.O_NOCTTY);
   const stream = fs.createReadStream("", { fd, autoClose: false });
