@@ -14,25 +14,26 @@ export async function openSerial(
   path: string,
   baudRate: number,
 ): Promise<SerialConnection> {
-  // Configure baud rate and raw mode via stty
-  const base = Bun.spawnSync([
-    "stty",
-    "-F",
-    path,
-    baudRate.toString(),
-    "raw",
-    "-echo",
-    "cs8",
-    "-parenb",
-    "-cstopb",
-  ]);
-  if (base.exitCode !== 0) {
-    const err = base.stderr.toString();
-    throw new Error(`Failed to configure ${path}: ${err}`);
+  // Configure serial port via stty — apply each setting individually
+  // since USB serial devices may not support all terminal options
+  const required = [baudRate.toString(), "raw"];
+  const optional = ["-echo", "cs8", "-parenb", "-cstopb", "-crtscts"];
+
+  for (const flag of required) {
+    const proc = Bun.spawnSync(["stty", "-F", path, flag]);
+    if (proc.exitCode !== 0) {
+      throw new Error(
+        `Failed to set ${flag} on ${path}: ${proc.stderr.toString()}`,
+      );
+    }
   }
 
-  // Disable hardware flow control if supported (not all devices support it)
-  Bun.spawnSync(["stty", "-F", path, "-crtscts"]);
+  for (const flag of optional) {
+    const proc = Bun.spawnSync(["stty", "-F", path, flag]);
+    if (proc.exitCode !== 0) {
+      log.warn(`stty ${flag} not supported on ${path}, skipping`);
+    }
+  }
 
   const fd = fs.openSync(path, fs.constants.O_RDWR | fs.constants.O_NOCTTY);
   const stream = fs.createReadStream("", { fd, autoClose: false });
