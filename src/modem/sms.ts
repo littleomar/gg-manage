@@ -83,7 +83,8 @@ function parseSmsResponse(resp: string, index: number): SmsMessage | null {
   const headerLine = lines.find((l) => l.startsWith("+CMGR:"));
   if (!headerLine) return null;
 
-  const match = headerLine.match(/\+CMGR:\s*"[^"]*",\s*"([^"]*)"(?:,\s*"[^"]*")?,\s*"?([^"]*)"?/);
+  const match = headerLine.match(/\+CMGR:\s*"[^"]*",\s*"([^"]*)"(?:,\s*(?:"[^"]*")?),\s*"([^"]*)"/);
+
   const sender = decodeField(match?.[1] ?? "Unknown");
   const timestamp = match?.[2] ?? "";
 
@@ -107,7 +108,8 @@ function parseSmsList(resp: string): SmsMessage[] {
     // Handle various formats:
     // +CMGL: 1,"REC UNREAD","+447xxx","","26/03/31,14:00:00+32"
     // +CMGL: 1,"REC UNREAD","00670069006600660067006100660066",,"26/04/01,02:48:18+4"
-    const match = line.match(/\+CMGL:\s*(\d+),\s*"[^"]*",\s*"([^"]*)"(?:,\s*"[^"]*")?,\s*"?([^"]*)"?/);
+    const match = line.match(/\+CMGL:\s*(\d+),\s*"[^"]*",\s*"([^"]*)"(?:,\s*(?:"[^"]*")?),\s*"([^"]*)"/);
+
     if (!match) {
       log.warn(`Failed to parse CMGL line: ${line}`);
       continue;
