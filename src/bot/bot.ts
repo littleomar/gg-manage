@@ -1,6 +1,7 @@
 import { Bot } from "grammy";
 import { SocksClient } from "socks";
 import * as tls from "node:tls";
+import * as net from "node:net";
 import type { Config } from "../config.ts";
 import { createLogger } from "../utils/logger.ts";
 
@@ -148,26 +149,161 @@ function decodeChunked(data: string): string {
   return parts.join("");
 }
 
-export function createBot(config: Config): Bot {
-  const isSocks = config.telegramProxyUrl?.startsWith("socks");
+function createHttpProxyFetch(proxyUrl: string): typeof fetch {
+  const proxy = new URL(proxyUrl);
+  const proxyHost = proxy.hostname;
+  const proxyPort = parseInt(proxy.port) || 8080;
 
-  if (config.telegramProxyUrl && !isSocks) {
-    log.info(`Using HTTP proxy: ${config.telegramProxyUrl}`);
-    process.env.HTTPS_PROXY = config.telegramProxyUrl;
-    process.env.HTTP_PROXY = config.telegramProxyUrl;
+  return async (input, init?) => {
+    const url = new URL(
+      typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url,
+    );
+    const method = init?.method ?? "GET";
+    const headers: Record<string, string> = {};
+
+    if (init?.headers instanceof Headers) {
+      init.headers.forEach((v, k) => (headers[k] = v));
+    } else if (init?.headers) {
+      Object.assign(headers, init.headers);
+    }
+
+    if (!headers["host"]) headers["host"] = url.host;
+
+    const targetHost = url.hostname;
+    const targetPort = parseInt(url.port) || (url.protocol === "https:" ? 443 : 80);
+
+    // HTTP CONNECT tunnel for HTTPS
+    const proxySocket = net.connect(proxyPort, proxyHost);
+    await new Promise<void>((resolve, reject) => {
+      proxySocket.once("connect", resolve);
+      proxySocket.once("error", reject);
+    });
+
+    if (url.protocol === "https:") {
+      // Send CONNECT request
+      proxySocket.write(`CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n\r\n`);
+
+      // Wait for 200 response
+      await new Promise<void>((resolve, reject) => {
+        let buf = "";
+        const onData = (chunk: Buffer) => {
+          buf += chunk.toString();
+          if (buf.includes("\r\n\r\n")) {
+            proxySocket.removeListener("data", onData);
+            if (buf.startsWith("HTTP/1.1 200") || buf.startsWith("HTTP/1.0 200")) {
+              resolve();
+            } else {
+              reject(new Error(`Proxy CONNECT failed: ${buf.split("\r\n")[0]}`));
+            }
+          }
+        };
+        proxySocket.on("data", onData);
+        proxySocket.once("error", reject);
+      });
+    }
+
+    // Upgrade to TLS for HTTPS
+    const socket = url.protocol === "https:"
+      ? tls.connect({ socket: proxySocket, servername: targetHost })
+      : proxySocket;
+
+    if (socket !== proxySocket) {
+      await new Promise<void>((resolve, reject) => {
+        (socket as tls.TLSSocket).once("secureConnect", resolve);
+        (socket as tls.TLSSocket).once("error", reject);
+      });
+    }
+
+    // Build and send HTTP request
+    let body: Buffer | null = null;
+    if (init?.body) {
+      if (typeof init.body === "string") {
+        body = Buffer.from(init.body);
+      } else if (init.body instanceof ArrayBuffer || init.body instanceof Uint8Array) {
+        body = Buffer.from(init.body);
+      } else if (init.body instanceof ReadableStream) {
+        const reader = init.body.getReader();
+        const chunks: Uint8Array[] = [];
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+        }
+        body = Buffer.concat(chunks);
+      } else {
+        body = Buffer.from(String(init.body));
+      }
+    }
+
+    if (body) headers["content-length"] = body.byteLength.toString();
+
+    const path = url.pathname + url.search;
+    const headerLines = Object.entries(headers)
+      .map(([k, v]) => `${k}: ${v}`)
+      .join("\r\n");
+
+    socket.write(`${method} ${path} HTTP/1.1\r\n${headerLines}\r\n\r\n`);
+    if (body) socket.write(body);
+
+    // Read response
+    return new Promise<Response>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      socket.on("data", (chunk: Buffer) => chunks.push(chunk));
+      socket.on("error", reject);
+      socket.on("end", () => {
+        const raw = Buffer.concat(chunks).toString();
+        const headerEnd = raw.indexOf("\r\n\r\n");
+        if (headerEnd === -1) {
+          reject(new Error("Invalid HTTP response"));
+          return;
+        }
+
+        const headerSection = raw.slice(0, headerEnd);
+        const bodySection = raw.slice(headerEnd + 4);
+        const [statusLine, ...headerParts] = headerSection.split("\r\n");
+        const statusMatch = statusLine.match(/HTTP\/[\d.]+ (\d+)\s*(.*)/);
+        const status = statusMatch ? parseInt(statusMatch[1]) : 200;
+        const statusText = statusMatch?.[2] ?? "";
+
+        const respHeaders: Record<string, string> = {};
+        for (const h of headerParts) {
+          const idx = h.indexOf(":");
+          if (idx > 0) {
+            respHeaders[h.slice(0, idx).trim().toLowerCase()] = h.slice(idx + 1).trim();
+          }
+        }
+
+        let responseBody: string;
+        if (respHeaders["transfer-encoding"]?.includes("chunked")) {
+          responseBody = decodeChunked(bodySection);
+        } else {
+          responseBody = bodySection;
+        }
+
+        resolve(
+          new Response(responseBody, { status, statusText, headers: respHeaders }),
+        );
+      });
+    });
+  };
+}
+
+export function createBot(config: Config): Bot {
+  if (!config.telegramProxyUrl) {
     return new Bot(config.telegramBotToken);
   }
 
-  if (config.telegramProxyUrl && isSocks) {
-    log.info(`Using SOCKS proxy: ${config.telegramProxyUrl}`);
-    return new Bot(config.telegramBotToken, {
-      client: {
-        fetch: createSocksFetch(config.telegramProxyUrl),
-      },
-    });
-  }
+  const isSocks = config.telegramProxyUrl.startsWith("socks");
+  const proxyType = isSocks ? "SOCKS" : "HTTP";
+  log.info(`Using ${proxyType} proxy: ${config.telegramProxyUrl}`);
 
-  return new Bot(config.telegramBotToken);
+  const customFetch = isSocks
+    ? createSocksFetch(config.telegramProxyUrl)
+    : createHttpProxyFetch(config.telegramProxyUrl);
+
+  return new Bot(config.telegramBotToken, {
+    client: { fetch: customFetch },
+  });
 }
 
 export async function sendMessage(bot: Bot, chatId: number, text: string): Promise<void> {
