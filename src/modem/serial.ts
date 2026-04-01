@@ -16,8 +16,8 @@ export async function openSerial(
 ): Promise<SerialConnection> {
   // Configure serial port via stty — apply each setting individually
   // since USB serial devices may not support all terminal options
-  const required = [baudRate.toString(), "raw"];
-  const optional = ["-echo", "cs8", "-parenb", "-cstopb", "-crtscts"];
+  const required = ["raw"];
+  const optional = [baudRate.toString(), "-echo", "cs8", "-parenb", "-cstopb", "-crtscts"];
 
   for (const flag of required) {
     const proc = Bun.spawnSync(["stty", "-F", path, flag]);
