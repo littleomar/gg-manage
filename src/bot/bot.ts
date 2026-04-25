@@ -301,15 +301,15 @@ export function createBot(config: Config): Bot {
 		return new Bot(config.telegramBotToken);
 	}
 
-	// const isSocks = config.telegramProxyUrl.startsWith("socks");
-	// const proxyType = isSocks ? "SOCKS" : "HTTP";
-	// log.info(`Using ${proxyType} proxy: ${config.telegramProxyUrl}`);
+	const isSocks = config.telegramProxyUrl.startsWith("socks");
+	const proxyType = isSocks ? "SOCKS" : "HTTP";
+	log.info(`Using ${proxyType} proxy: ${config.telegramProxyUrl}`);
 
-	// const customFetch = isSocks
-	//   ? createSocksFetch(config.telegramProxyUrl)
-	//   : createHttpProxyFetch(config.telegramProxyUrl);
+	const customFetch = isSocks
+		? createSocksFetch(config.telegramProxyUrl)
+		: createHttpProxyFetch(config.telegramProxyUrl);
 
-	const customFetch = createHttpProxyFetch(config.telegramProxyUrl);
+	// const customFetch = createHttpProxyFetch(config.telegramProxyUrl);
 
 	return new Bot(config.telegramBotToken, {
 		client: { fetch: customFetch },
