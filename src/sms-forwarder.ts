@@ -2,6 +2,7 @@ import type { Bot } from "grammy";
 import type { AtParser } from "./modem/at-parser.ts";
 import { readSms, listUnreadSms, deleteSms } from "./modem/sms.ts";
 import { sendMessage } from "./bot/bot.ts";
+import { escapeHtml } from "./utils/html.ts";
 import { formatTime } from "./utils/time.ts";
 import { createLogger } from "./utils/logger.ts";
 
@@ -83,8 +84,4 @@ export class SmsForwarder {
     await sendMessage(this.bot, this.chatId, msg);
     log.info(`Forwarded SMS from ${sender}`);
   }
-}
-
-function escapeHtml(text: string): string {
-  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }

@@ -11,6 +11,13 @@ const configSchema = z.object({
 
   smsPollIntervalMs: z.coerce.number().int().positive().default(60000),
 
+  keepaliveUrl: z.string().url().default("https://www.gstatic.com/generate_204"),
+  keepaliveTimeoutMs: z.coerce.number().int().positive().default(15000),
+  giffgaffDashboardUrl: z
+    .string()
+    .url()
+    .default("https://www.giffgaff.com/dashboard"),
+
   dataDir: z.string().default("./data"),
 });
 
