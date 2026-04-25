@@ -184,50 +184,6 @@ async function connectTls(
 	return tlsSocket;
 }
 
-function createSocksFetch(proxyUrl: string): typeof fetch {
-	const parsed = new URL(proxyUrl);
-	const proxy = {
-		host: parsed.hostname,
-		port: parseInt(parsed.port) || 1080,
-		type: (parsed.protocol.startsWith("socks4") ? 4 : 5) as 4 | 5,
-		...(parsed.username ? { userId: parsed.username } : {}),
-		...(parsed.password ? { password: parsed.password } : {}),
-	};
-
-	return async (input, init?) => {
-		const url = new URL(
-			typeof input === "string"
-				? input
-				: input instanceof URL
-					? input.toString()
-					: input.url,
-		);
-		const headers = buildHeaders(init, url.host);
-		const body = await readBody(init);
-
-		const { socket } = await SocksClient.createConnection({
-			proxy,
-			command: "connect",
-			destination: {
-				host: url.hostname,
-				port: parseInt(url.port) || (url.protocol === "https:" ? 443 : 80),
-			},
-		});
-
-		const conn =
-			url.protocol === "https:"
-				? await connectTls(socket, url.hostname)
-				: socket;
-		return httpOverSocket(
-			conn,
-			init?.method ?? "GET",
-			url.pathname + url.search,
-			headers,
-			body,
-		);
-	};
-}
-
 function createHttpProxyFetch(proxyUrl: string): typeof fetch {
 	const proxy = new URL(proxyUrl);
 	const proxyHost = proxy.hostname;
@@ -301,15 +257,7 @@ export function createBot(config: Config): Bot {
 		return new Bot(config.telegramBotToken);
 	}
 
-	const isSocks = config.telegramProxyUrl.startsWith("socks");
-	const proxyType = isSocks ? "SOCKS" : "HTTP";
-	log.info(`Using ${proxyType} proxy: ${config.telegramProxyUrl}`);
-
-	const customFetch = isSocks
-		? createSocksFetch(config.telegramProxyUrl)
-		: createHttpProxyFetch(config.telegramProxyUrl);
-
-	// const customFetch = createHttpProxyFetch(config.telegramProxyUrl);
+	const customFetch = createHttpProxyFetch(config.telegramProxyUrl);
 
 	return new Bot(config.telegramBotToken, {
 		client: { fetch: customFetch },
