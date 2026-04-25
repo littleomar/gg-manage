@@ -2,7 +2,6 @@ import * as net from "node:net";
 import type { Duplex } from "node:stream";
 import * as tls from "node:tls";
 import { Bot } from "grammy";
-import { SocksClient } from "socks";
 import type { Config } from "../config.ts";
 import { createLogger } from "../utils/logger.ts";
 
@@ -188,6 +187,7 @@ function createHttpProxyFetch(proxyUrl: string): typeof fetch {
 	const proxy = new URL(proxyUrl);
 	const proxyHost = proxy.hostname;
 	const proxyPort = parseInt(proxy.port) || 8080;
+	log.info(`HTTP proxy configured: ${proxyHost}:${proxyPort}`);
 
 	return async (input, init?) => {
 		const url = new URL(
@@ -197,6 +197,7 @@ function createHttpProxyFetch(proxyUrl: string): typeof fetch {
 					? input.toString()
 					: input.url,
 		);
+		const method = init?.method ?? "GET";
 		const headers = buildHeaders(init, url.host);
 		const body = await readBody(init);
 
@@ -204,51 +205,72 @@ function createHttpProxyFetch(proxyUrl: string): typeof fetch {
 		const targetPort =
 			parseInt(url.port) || (url.protocol === "https:" ? 443 : 80);
 
-		const proxySocket = net.connect(proxyPort, proxyHost);
-		await new Promise<void>((resolve, reject) => {
-			proxySocket.once("connect", resolve);
-			proxySocket.once("error", reject);
-		});
+		log.info(
+			`→ ${method} ${targetHost}:${targetPort}${url.pathname} via proxy ${proxyHost}:${proxyPort}`,
+		);
+		const t0 = Date.now();
 
-		if (url.protocol === "https:") {
-			// HTTP CONNECT tunnel
-			proxySocket.write(
-				`CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n\r\n`,
-			);
+		try {
+			const proxySocket = net.connect(proxyPort, proxyHost);
 			await new Promise<void>((resolve, reject) => {
-				let buf = "";
-				const onData = (chunk: Buffer) => {
-					buf += chunk.toString();
-					if (buf.includes("\r\n\r\n")) {
-						proxySocket.removeListener("data", onData);
-						if (
-							buf.startsWith("HTTP/1.1 200") ||
-							buf.startsWith("HTTP/1.0 200")
-						) {
-							resolve();
-						} else {
-							reject(
-								new Error(`Proxy CONNECT failed: ${buf.split("\r\n")[0]}`),
-							);
-						}
-					}
-				};
-				proxySocket.on("data", onData);
+				proxySocket.once("connect", resolve);
 				proxySocket.once("error", reject);
 			});
-		}
+			log.info(`✓ TCP to proxy established (${Date.now() - t0}ms)`);
 
-		const conn =
-			url.protocol === "https:"
-				? await connectTls(proxySocket, targetHost)
-				: proxySocket;
-		return httpOverSocket(
-			conn,
-			init?.method ?? "GET",
-			url.pathname + url.search,
-			headers,
-			body,
-		);
+			if (url.protocol === "https:") {
+				proxySocket.write(
+					`CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n\r\n`,
+				);
+				await new Promise<void>((resolve, reject) => {
+					let buf = "";
+					const onData = (chunk: Buffer) => {
+						buf += chunk.toString();
+						if (buf.includes("\r\n\r\n")) {
+							proxySocket.removeListener("data", onData);
+							const statusLine = buf.split("\r\n")[0];
+							if (
+								buf.startsWith("HTTP/1.1 200") ||
+								buf.startsWith("HTTP/1.0 200")
+							) {
+								log.info(`✓ CONNECT tunnel open: ${statusLine}`);
+								resolve();
+							} else {
+								reject(new Error(`Proxy CONNECT failed: ${statusLine}`));
+							}
+						}
+					};
+					proxySocket.on("data", onData);
+					proxySocket.once("error", reject);
+				});
+			}
+
+			const conn =
+				url.protocol === "https:"
+					? await connectTls(proxySocket, targetHost)
+					: proxySocket;
+			if (url.protocol === "https:") {
+				log.info(`✓ TLS handshake complete with ${targetHost}`);
+			}
+
+			const res = await httpOverSocket(
+				conn,
+				method,
+				url.pathname + url.search,
+				headers,
+				body,
+			);
+			log.info(
+				`← ${res.status} ${targetHost}${url.pathname} (${Date.now() - t0}ms)`,
+			);
+			return res;
+		} catch (e) {
+			log.error(
+				`✗ Proxy fetch failed for ${targetHost}${url.pathname} (${Date.now() - t0}ms):`,
+				e,
+			);
+			throw e;
+		}
 	};
 }
 
