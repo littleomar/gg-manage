@@ -5,7 +5,9 @@ const LOGIN_API_URL = "https://id.giffgaff.com/auth/login";
 const MFA_TIMEOUT_MS = 90_000;
 const REQUEST_TIMEOUT_MS = 15_000;
 const DEFAULT_USER_AGENT =
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
+const SEC_CH_UA =
+  '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"';
 
 const log = createLogger("account.login");
 
@@ -257,6 +259,14 @@ export class GiffgaffHttpLoginService implements GiffgaffLoginService {
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
           ...commonHeaders,
           "Upgrade-Insecure-Requests": "1",
+          "sec-ch-ua": SEC_CH_UA,
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": '"macOS"',
+          "sec-fetch-dest": "document",
+          "sec-fetch-mode": "navigate",
+          "sec-fetch-site": "none",
+          "sec-fetch-user": "?1",
+          priority: "u=0, i",
         },
         redirect: "manual",
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
@@ -282,6 +292,14 @@ export class GiffgaffHttpLoginService implements GiffgaffLoginService {
               ...commonHeaders,
               Cookie: serializeCookies(jar),
               "Upgrade-Insecure-Requests": "1",
+              "sec-ch-ua": SEC_CH_UA,
+              "sec-ch-ua-mobile": "?0",
+              "sec-ch-ua-platform": '"macOS"',
+              "sec-fetch-dest": "document",
+              "sec-fetch-mode": "navigate",
+              "sec-fetch-site": "same-origin",
+              "sec-fetch-user": "?1",
+              priority: "u=0, i",
             },
             redirect: "manual",
             signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
@@ -325,6 +343,13 @@ export class GiffgaffHttpLoginService implements GiffgaffLoginService {
             device: "web",
             "device-id": deviceId,
             Origin: "https://www.giffgaff.com",
+            "sec-ch-ua": SEC_CH_UA,
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"macOS"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-site",
+            priority: "u=1, i",
           },
           body: JSON.stringify({
             memberName: this.#username,
@@ -403,6 +428,13 @@ export class GiffgaffHttpLoginService implements GiffgaffLoginService {
           device: "web",
           "device-id": deviceId,
           Origin: "https://www.giffgaff.com",
+          "sec-ch-ua": SEC_CH_UA,
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": '"macOS"',
+          "sec-fetch-dest": "empty",
+          "sec-fetch-mode": "cors",
+          "sec-fetch-site": "same-site",
+          priority: "u=1, i",
         },
         body: JSON.stringify({
           memberName: this.#username,
