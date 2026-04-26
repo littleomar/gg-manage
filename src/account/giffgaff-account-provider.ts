@@ -124,7 +124,11 @@ export class GiffgaffAccountProvider implements AccountProvider {
     responseUrl: string;
     failureReason?: string;
   }> {
-    log.info(`Refreshing dashboard at ${this.#dashboardUrl}`);
+    const cookieCount = cookie.split(";").filter((s) => s.trim()).length;
+    log.info(
+      `Dashboard → GET ${this.#dashboardUrl} | Cookie=<${cookieCount} cookies, ${cookie.length}b>`,
+    );
+    const started = Date.now();
     const response = await this.#fetch(this.#dashboardUrl, {
       headers: {
         Accept:
@@ -140,6 +144,10 @@ export class GiffgaffAccountProvider implements AccountProvider {
       signal: AbortSignal.timeout(this.#dashboardTimeoutMs),
     });
     const responseUrl = response.url || this.#dashboardUrl;
+    const ct = response.headers.get("content-type") ?? "-";
+    log.info(
+      `Dashboard ← HTTP ${response.status} ${response.statusText || ""} in ${Date.now() - started}ms | content-type=${ct} | final-url=${responseUrl}`,
+    );
 
     if (!response.ok) {
       return {
@@ -151,6 +159,9 @@ export class GiffgaffAccountProvider implements AccountProvider {
 
     const html = await response.text();
     const parsedBalance = extractAirtimeCreditFromDashboard(html);
+    log.info(
+      `Dashboard body received: ${html.length}b; parsedBalance=${parsedBalance ?? "<not found>"}.`,
+    );
     return {
       parsedBalance,
       responseUrl,
@@ -162,16 +173,25 @@ export class GiffgaffAccountProvider implements AccountProvider {
 
   async #tryAutoLogin(reason: string): Promise<string | null> {
     if (!this.#loginService) {
+      log.warn(
+        `Auto-login skipped (${reason}): no login service configured (GG_USERNAME/GG_PASSWORD missing).`,
+      );
       return null;
     }
-    log.info(`Attempting auto-login (${reason}).`);
+    log.info(`Attempting auto-login (reason: ${reason}).`);
+    const startedAt = Date.now();
     try {
       const cookie = await this.#loginService.login();
       await this.#cookieStore.set(cookie);
-      log.info("Auto-login succeeded; cookie stored.");
+      log.info(
+        `Auto-login succeeded in ${Date.now() - startedAt}ms; cookie stored (length=${cookie.length}).`,
+      );
       return cookie;
     } catch (e) {
-      log.warn("Auto-login failed:", e);
+      log.warn(
+        `Auto-login failed after ${Date.now() - startedAt}ms:`,
+        e instanceof Error ? e.message : e,
+      );
       return null;
     }
   }

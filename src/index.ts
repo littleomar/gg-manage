@@ -107,12 +107,33 @@ async function main() {
 
   if (loginService) {
     forwarder.addInterceptor((sms) => {
-      if (!loginService.isLoginInProgress()) return false;
       const code = extractMfaCode(sms.body);
-      if (!code) return false;
-      log.info("Intercepted giffgaff MFA SMS; forwarding code to login flow");
-      return loginService.receiveMfaCode(code);
+      if (!loginService.isLoginInProgress()) {
+        if (code) {
+          log.warn(
+            `Received giffgaff MFA SMS from ${sms.sender} but no auto-login is in progress; passing through.`,
+          );
+        }
+        return false;
+      }
+      if (!code) {
+        log.info(
+          `Auto-login in progress but SMS from ${sms.sender} did not match MFA pattern; passing through.`,
+        );
+        return false;
+      }
+      log.info(
+        `Intercepted giffgaff MFA SMS from ${sms.sender}; forwarding code (****${code.slice(-2)}) to login flow.`,
+      );
+      const accepted = loginService.receiveMfaCode(code);
+      if (!accepted) {
+        log.warn(
+          "MFA code was extracted but login flow had no resolver (race?); SMS will pass through.",
+        );
+      }
+      return accepted;
     });
+    log.info("MFA SMS interceptor registered for auto-login flow.");
   }
 
   forwarder.start();
