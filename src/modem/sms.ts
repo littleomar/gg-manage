@@ -3,11 +3,19 @@ import { createLogger } from "../utils/logger.ts";
 
 const log = createLogger("sms");
 
+export type SmsStatus = "REC UNREAD" | "REC READ" | "STO UNSENT" | "STO SENT" | string;
+
 export interface SmsMessage {
   index: number;
+  status: SmsStatus;
   sender: string;
   timestamp: string;
   body: string;
+}
+
+export interface SmsStorageInfo {
+  used: number;
+  total: number;
 }
 
 export async function initSms(at: AtParser): Promise<void> {
@@ -15,6 +23,19 @@ export async function initSms(at: AtParser): Promise<void> {
   await at.execute('AT+CPMS="ME","ME","ME"'); // Use modem storage
   await at.execute("AT+CNMI=2,1,0,0,0"); // Enable +CMTI URC for new SMS
   log.info("SMS initialized (text mode, URC enabled)");
+}
+
+export async function getStorageInfo(at: AtParser): Promise<SmsStorageInfo | null> {
+  try {
+    const resp = await at.execute("AT+CPMS?");
+    // +CPMS: "ME",5,50,"ME",5,50,"ME",5,50
+    const match = resp.match(/\+CPMS:\s*"[^"]*",(\d+),(\d+)/);
+    if (!match) return null;
+    return { used: parseInt(match[1]!), total: parseInt(match[2]!) };
+  } catch (e) {
+    log.error("Failed to read storage info:", e);
+    return null;
+  }
 }
 
 export async function readSms(at: AtParser, index: number): Promise<SmsMessage | null> {
@@ -27,12 +48,13 @@ export async function readSms(at: AtParser, index: number): Promise<SmsMessage |
   }
 }
 
-export async function listUnreadSms(at: AtParser): Promise<SmsMessage[]> {
+export async function listAllSms(at: AtParser): Promise<SmsMessage[]> {
   try {
-    const resp = await at.execute('AT+CMGL="REC UNREAD"');
+    const resp = await at.execute('AT+CMGL="ALL"');
     if (!resp.trim()) return [];
     return parseSmsList(resp);
-  } catch {
+  } catch (e) {
+    log.error("Failed to list all SMS:", e);
     return [];
   }
 }
@@ -83,10 +105,11 @@ function parseSmsResponse(resp: string, index: number): SmsMessage | null {
   const headerLine = lines.find((l) => l.startsWith("+CMGR:"));
   if (!headerLine) return null;
 
-  const match = headerLine.match(/\+CMGR:\s*"[^"]*",\s*"([^"]*)"(?:,\s*(?:"[^"]*")?),\s*"([^"]*)"/);
+  const match = headerLine.match(/\+CMGR:\s*"([^"]*)",\s*"([^"]*)"(?:,\s*(?:"[^"]*")?),\s*"([^"]*)"/);
 
-  const sender = decodeField(match?.[1] ?? "Unknown");
-  const timestamp = match?.[2] ?? "";
+  const status = match?.[1] ?? "";
+  const sender = decodeField(match?.[2] ?? "Unknown");
+  const timestamp = match?.[3] ?? "";
 
   const headerIdx = lines.indexOf(headerLine);
   const rawBody = lines
@@ -94,7 +117,7 @@ function parseSmsResponse(resp: string, index: number): SmsMessage | null {
     .join("\n")
     .trim();
 
-  return { index, sender, timestamp, body: decodeField(rawBody) };
+  return { index, status, sender, timestamp, body: decodeField(rawBody) };
 }
 
 function parseSmsList(resp: string): SmsMessage[] {
@@ -108,7 +131,7 @@ function parseSmsList(resp: string): SmsMessage[] {
     // Handle various formats:
     // +CMGL: 1,"REC UNREAD","+447xxx","","26/03/31,14:00:00+32"
     // +CMGL: 1,"REC UNREAD","00670069006600660067006100660066",,"26/04/01,02:48:18+4"
-    const match = line.match(/\+CMGL:\s*(\d+),\s*"[^"]*",\s*"([^"]*)"(?:,\s*(?:"[^"]*")?),\s*"([^"]*)"/);
+    const match = line.match(/\+CMGL:\s*(\d+),\s*"([^"]*)",\s*"([^"]*)"(?:,\s*(?:"[^"]*")?),\s*"([^"]*)"/);
 
     if (!match) {
       log.warn(`Failed to parse CMGL line: ${line}`);
@@ -116,8 +139,9 @@ function parseSmsList(resp: string): SmsMessage[] {
     }
 
     const index = parseInt(match[1]!);
-    const sender = decodeField(match[2] ?? "Unknown");
-    const timestamp = match[3] ?? "";
+    const status = match[2] ?? "";
+    const sender = decodeField(match[3] ?? "Unknown");
+    const timestamp = match[4] ?? "";
 
     const bodyLines: string[] = [];
     for (let j = i + 1; j < lines.length; j++) {
@@ -126,7 +150,7 @@ function parseSmsList(resp: string): SmsMessage[] {
     }
 
     const rawBody = bodyLines.join("\n").trim();
-    messages.push({ index, sender, timestamp, body: decodeField(rawBody) });
+    messages.push({ index, status, sender, timestamp, body: decodeField(rawBody) });
   }
 
   return messages;
