@@ -17,6 +17,8 @@ const configSchema = z.object({
     .string()
     .url()
     .default("https://www.giffgaff.com/dashboard"),
+  giffgaffUsername: z.string().min(1).optional(),
+  giffgaffPassword: z.string().min(1).optional(),
 
   dataDir: z.string().default("./data"),
 });
@@ -32,6 +34,8 @@ export function loadConfig(): Config {
     telegramChatId: process.env.TELEGRAM_CHAT_ID,
     telegramProxyUrl: process.env.TELEGRAM_PROXY_URL || undefined,
     smsPollIntervalMs: process.env.SMS_POLL_INTERVAL_MS,
+    giffgaffUsername: process.env.GG_USERNAME || undefined,
+    giffgaffPassword: process.env.GG_PASSWORD || undefined,
     dataDir: process.env.DATA_DIR,
   });
 }

@@ -7,6 +7,7 @@ import {
   parseGiffgaffBalance,
 } from "./parser.ts";
 import type { AccountCookieStore } from "./cookie-store.ts";
+import type { GiffgaffLoginService } from "./giffgaff-login-service.ts";
 import type {
   AccountProvider,
   AccountRefreshResult,
@@ -31,6 +32,7 @@ export interface GiffgaffAccountProviderOptions {
   acceptLanguage?: string;
   userAgent?: string;
   dashboardTimeoutMs?: number;
+  loginService?: GiffgaffLoginService;
 }
 
 export class GiffgaffAccountProvider implements AccountProvider {
@@ -42,6 +44,7 @@ export class GiffgaffAccountProvider implements AccountProvider {
   readonly #acceptLanguage: string;
   readonly #userAgent: string;
   readonly #dashboardTimeoutMs: number;
+  readonly #loginService?: GiffgaffLoginService;
 
   constructor(options: GiffgaffAccountProviderOptions) {
     this.#at = options.at;
@@ -53,6 +56,7 @@ export class GiffgaffAccountProvider implements AccountProvider {
     this.#userAgent = options.userAgent ?? DEFAULT_USER_AGENT;
     this.#dashboardTimeoutMs =
       options.dashboardTimeoutMs ?? DEFAULT_DASHBOARD_TIMEOUT_MS;
+    this.#loginService = options.loginService;
   }
 
   async getStatus(): Promise<AccountSummary> {
@@ -73,13 +77,53 @@ export class GiffgaffAccountProvider implements AccountProvider {
   }
 
   async refreshViaDashboard(): Promise<AccountRefreshResult> {
-    const cookie = await this.#cookieStore.get();
+    let cookie = await this.#cookieStore.get();
+
     if (!cookie) {
-      throw new Error(
-        "Dashboard cookie is not configured. Set it with /accountcookie <cookie>.",
+      cookie = await this.#tryAutoLogin(
+        "no cookie stored",
       );
     }
 
+    if (!cookie) {
+      throw new Error(
+        "Dashboard cookie is not configured. Set GG_USERNAME/GG_PASSWORD for auto-login or use /accountcookie <cookie>.",
+      );
+    }
+
+    let attempt = await this.#fetchAndParseDashboard(cookie);
+
+    if (!attempt.parsedBalance) {
+      const fresh = await this.#tryAutoLogin(
+        attempt.failureReason ?? "dashboard parse failed",
+      );
+      if (fresh) {
+        attempt = await this.#fetchAndParseDashboard(fresh);
+      }
+    }
+
+    if (!attempt.parsedBalance) {
+      throw new Error(
+        attempt.failureReason ??
+          "Could not find the dashboard credit balance. The cookie may be expired or the page structure changed.",
+      );
+    }
+
+    await this.#tracker.recordBalanceChange(attempt.parsedBalance);
+    const summary = await this.#tracker.getStatus();
+    return {
+      source: "dashboard",
+      rawResponse: attempt.responseUrl,
+      parsedBalance: attempt.parsedBalance,
+      summary,
+    };
+  }
+
+  async #fetchAndParseDashboard(cookie: string): Promise<{
+    parsedBalance: string | null;
+    responseUrl: string;
+    failureReason?: string;
+  }> {
     log.info(`Refreshing dashboard at ${this.#dashboardUrl}`);
     const response = await this.#fetch(this.#dashboardUrl, {
       headers: {
@@ -95,28 +139,40 @@ export class GiffgaffAccountProvider implements AccountProvider {
       redirect: "follow",
       signal: AbortSignal.timeout(this.#dashboardTimeoutMs),
     });
+    const responseUrl = response.url || this.#dashboardUrl;
 
     if (!response.ok) {
-      throw new Error(
-        `Dashboard request failed: HTTP ${response.status}. The cookie may be expired.`,
-      );
+      return {
+        parsedBalance: null,
+        responseUrl,
+        failureReason: `Dashboard request failed: HTTP ${response.status}.`,
+      };
     }
 
     const html = await response.text();
     const parsedBalance = extractAirtimeCreditFromDashboard(html);
-    if (!parsedBalance) {
-      throw new Error(
-        "Could not find the dashboard credit balance. The cookie may be expired or the page structure changed.",
-      );
-    }
-
-    await this.#tracker.recordBalanceChange(parsedBalance);
-    const summary = await this.#tracker.getStatus();
     return {
-      source: "dashboard",
-      rawResponse: response.url || this.#dashboardUrl,
       parsedBalance,
-      summary,
+      responseUrl,
+      failureReason: parsedBalance
+        ? undefined
+        : "Could not find dashboard balance (cookie likely expired).",
     };
+  }
+
+  async #tryAutoLogin(reason: string): Promise<string | null> {
+    if (!this.#loginService) {
+      return null;
+    }
+    log.info(`Attempting auto-login (${reason}).`);
+    try {
+      const cookie = await this.#loginService.login();
+      await this.#cookieStore.set(cookie);
+      log.info("Auto-login succeeded; cookie stored.");
+      return cookie;
+    } catch (e) {
+      log.warn("Auto-login failed:", e);
+      return null;
+    }
   }
 }

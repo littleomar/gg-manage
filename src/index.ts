@@ -1,5 +1,9 @@
 import { AccountCookieStore } from "./account/cookie-store.ts";
 import { GiffgaffAccountProvider } from "./account/giffgaff-account-provider.ts";
+import {
+  GiffgaffHttpLoginService,
+  extractMfaCode,
+} from "./account/giffgaff-login-service.ts";
 import { AlertsLog } from "./alerts.ts";
 import { BalanceTracker } from "./balance-tracker.ts";
 import { createBot, sendMessage } from "./bot/bot.ts";
@@ -50,12 +54,28 @@ async function main() {
   const alerts = new AlertsLog(config.dataDir);
   const proxyFetch = createProxyFetch(config.telegramProxyUrl);
 
+  const loginService =
+    config.giffgaffUsername && config.giffgaffPassword
+      ? new GiffgaffHttpLoginService({
+          username: config.giffgaffUsername,
+          password: config.giffgaffPassword,
+          fetch: proxyFetch,
+        })
+      : undefined;
+
+  if (!loginService) {
+    log.warn(
+      "GG_USERNAME/GG_PASSWORD not set; /account auto-login disabled.",
+    );
+  }
+
   const account = new GiffgaffAccountProvider({
     at,
     tracker,
     cookieStore,
     fetch: proxyFetch,
     dashboardUrl: config.giffgaffDashboardUrl,
+    loginService,
   });
 
   const keepalive = new KeepaliveJob({
@@ -75,6 +95,7 @@ async function main() {
     keepalive,
     alerts,
     allowedChatId: config.telegramChatId,
+    loginService,
   });
 
   const forwarder = new SmsForwarder(
@@ -83,6 +104,17 @@ async function main() {
     config.telegramChatId,
     config.smsPollIntervalMs,
   );
+
+  if (loginService) {
+    forwarder.addInterceptor((sms) => {
+      if (!loginService.isLoginInProgress()) return false;
+      const code = extractMfaCode(sms.body);
+      if (!code) return false;
+      log.info("Intercepted giffgaff MFA SMS; forwarding code to login flow");
+      return loginService.receiveMfaCode(code);
+    });
+  }
+
   forwarder.start();
 
   const shutdown = async () => {

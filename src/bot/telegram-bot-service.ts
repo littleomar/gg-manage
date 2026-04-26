@@ -1,6 +1,7 @@
 import type { Bot, Context } from "grammy";
 import type { AccountProvider } from "../account/provider.ts";
 import type { AccountCookieStore } from "../account/cookie-store.ts";
+import type { GiffgaffHttpLoginService } from "../account/giffgaff-login-service.ts";
 import type { AlertsLog } from "../alerts.ts";
 import type { AtParser } from "../modem/at-parser.ts";
 import type { KeepaliveJob } from "../jobs/keepalive-job.ts";
@@ -43,6 +44,7 @@ export interface TelegramBotServiceOptions {
   keepalive: KeepaliveJob;
   alerts: AlertsLog;
   allowedChatId: number;
+  loginService?: GiffgaffHttpLoginService;
 }
 
 export class TelegramBotService {
@@ -53,6 +55,7 @@ export class TelegramBotService {
   readonly #keepalive: KeepaliveJob;
   readonly #alerts: AlertsLog;
   readonly #allowedChatId: number;
+  readonly #loginService?: GiffgaffHttpLoginService;
 
   constructor(options: TelegramBotServiceOptions) {
     this.#bot = options.bot;
@@ -62,6 +65,7 @@ export class TelegramBotService {
     this.#keepalive = options.keepalive;
     this.#alerts = options.alerts;
     this.#allowedChatId = options.allowedChatId;
+    this.#loginService = options.loginService;
   }
 
   async start(onStart: () => Promise<void> | void): Promise<void> {
@@ -121,6 +125,13 @@ export class TelegramBotService {
     const chatId = ctx.chat?.id;
     logger.info("Handling /account.", { chatId });
     await ctx.reply("Refreshing dashboard...");
+
+    this.#loginService?.setOnAwaitingMfa(() => {
+      void ctx
+        .reply("Awaiting giffgaff verification SMS (up to 90s)...")
+        .catch(() => undefined);
+    });
+
     try {
       const result = await this.#account.refreshViaDashboard();
       await ctx.reply(formatAccountSummary(result), { parse_mode: "HTML" });
@@ -137,6 +148,8 @@ export class TelegramBotService {
         { error: details },
       );
       await ctx.reply(`Failed to refresh account: ${details}`);
+    } finally {
+      this.#loginService?.setOnAwaitingMfa(null);
     }
   }
 
